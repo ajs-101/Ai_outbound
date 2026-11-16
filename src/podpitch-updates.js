@@ -25,7 +25,7 @@ const TIMEOUT_MS = 20000; // PodPitch can be slow; each request also gets one re
 const META_TTL_MS = 6 * 3600 * 1000; // campaigns + profiles cached 6 hours
 const MAX_POSTS_PER_RUN = 4; // keeps each run inside the free plan's 50-request limit
 const FIRST_RUN_LOOKBACK_HOURS = 48; // first run only: post replies from the last 48 hours
-const THREAD_PAGE = 25;
+const THREAD_PAGE = 15; // smaller pages answer faster
 const DIGEST_DRAFT_PAGE = 50;
 const DIGEST_MAX_PAGES = 6;
 const DIGEST_DETAILS = 5; // shows per client that get full metrics in the digest
@@ -79,7 +79,7 @@ export async function runPodpitchUpdates(env, deps, opts = {}) {
 		cursor = res.next_cursor;
 	}
 
-	const report = { dry, watermark: new Date(watermark).toISOString(), found: fresh.length, posted: [], skipped: [] };
+	const report = { dry, watermark: new Date(watermark).toISOString(), found: fresh.length, posted: [], skipped: [], steps: pp.steps };
 	let newest = watermark;
 
 	// Oldest first so the channel reads in order.
@@ -111,6 +111,11 @@ export async function runPodpitchUpdates(env, deps, opts = {}) {
 				newest = Math.max(newest, ts);
 				continue;
 			}
+			if (card.autoReply) {
+				report.skipped.push(`${label}: auto-reply / out of office (from the message text)`);
+				newest = Math.max(newest, ts);
+				continue;
+			}
 			if (!dry) {
 				await deps.slackPost(env, channel, { text: card.text, blocks: card.blocks, unfurl_links: false, unfurl_media: false });
 				await env.HANDOFF_KV.put(`ppthread:${t.thread_id}`, String(ts), { expirationTtl: 180 * 24 * 3600 });
@@ -136,6 +141,12 @@ export async function runPodpitchUpdates(env, deps, opts = {}) {
 		}
 
 		const card = await buildReplyCard(env, pp, meta, t, ours);
+		if (card.autoReply) {
+			report.skipped.push(`${label}: auto-reply / out of office (from the message text)`);
+			if (!dry) await env.HANDOFF_KV.put(`ppthread:${t.thread_id}`, String(ts), { expirationTtl: 180 * 24 * 3600 });
+			newest = Math.max(newest, ts);
+			continue;
+		}
 		if (!dry) {
 			await deps.slackPost(env, channel, { text: card.text, blocks: card.blocks, unfurl_links: false, unfurl_media: false });
 			await env.HANDOFF_KV.put(`ppthread:${t.thread_id}`, String(ts), { expirationTtl: 180 * 24 * 3600 });
@@ -191,6 +202,8 @@ async function buildReplyCard(env, pp, meta, t, ours, opts = {}) {
 
 	const rawBody = hostMsg?.body || hostMsg?.snippet || t.preview || '';
 	const text = trimMessage(latestOnly(htmlToText(rawBody)));
+	// Auto-replies are not always labelled by PodPitch yet; catch them from the text itself.
+	if (!opts.allowAuto && isAutoReplyText(text)) return { autoReply: true };
 	const bookings = findBookingLinks(rawBody);
 
 	// Podcast metrics
@@ -252,6 +265,39 @@ async function buildReplyCard(env, pp, meta, t, ours, opts = {}) {
 /* =========================================================================
  * 2. DAILY DIGEST OF NEW MATCHES
  * ========================================================================= */
+
+// /podpitch/test : reposts the newest real host reply (positive / meeting requested) as a card marked
+// TEST, so the card layout can be checked. Changes nothing: no "posted" markers, no watermark.
+export async function runPodpitchTest(env, deps) {
+	const channel = env.PODPITCH_UPDATES_CHANNEL;
+	const ours = ourDomains(env);
+	const pp = await connect(env);
+	const meta = await loadMeta(env, pp);
+	const res = await pp.call('list_inbox_threads', { limit: THREAD_PAGE });
+	const items = res?.data || res?.threads || [];
+	const pick =
+		items.find(
+			(t) =>
+				['positive_reply', 'meeting_requested'].includes(t.category) &&
+				!ours.some((d) =>
+					String(t.from_address || '')
+						.toLowerCase()
+						.endsWith(d),
+				),
+		) || items.find((t) => ['positive_reply', 'meeting_requested'].includes(t.category));
+	if (!pick)
+		return { posted: false, reason: `No positive or meeting-requested reply in the latest ${THREAD_PAGE} threads`, steps: pp.steps };
+	const card = await buildReplyCard(env, pp, meta, pick, ours, { allowAuto: true });
+	const blocks = [
+		{
+			type: 'context',
+			elements: [{ type: 'mrkdwn', text: '*TEST card*: a re-post of the latest real host reply to check the layout. Not a new reply.' }],
+		},
+		...card.blocks,
+	];
+	await deps.slackPost(env, channel, { text: `TEST: ${card.text}`, blocks, unfurl_links: false, unfurl_media: false });
+	return { posted: true, test_of: card.summary, steps: pp.steps };
+}
 
 export async function runPodpitchDigest(env, deps, opts = {}) {
 	const dry = Boolean(opts.dry);
@@ -324,6 +370,19 @@ export async function runPodpitchDigest(env, deps, opts = {}) {
 async function loadMeta(env, pp, force = false) {
 	const cached = JSON.parse((await env.HANDOFF_KV.get('pp:meta')) || 'null');
 	if (!force && cached && Date.now() - cached.at < META_TTL_MS) return cached;
+	try {
+		return await fetchMeta(env, pp);
+	} catch (err) {
+		// PodPitch slow: an older campaign list is fine for naming clients; try again next run.
+		if (cached) {
+			console.warn(`PodPitch campaigns refresh failed, using cached list: ${err.message}`);
+			return cached;
+		}
+		throw err;
+	}
+}
+
+async function fetchMeta(env, pp) {
 	const campaigns = [];
 	let before = null;
 	for (let page = 0; page < 3; page++) {
@@ -467,6 +526,16 @@ function htmlToText(html) {
 
 // Cuts the quoted history: Gmail ("On ... wrote:"), Outlook ("From: ... Sent:/Date: ... To: ... Subject:"),
 // "-----Original Message-----", "________________" separators and ">" quoted lines.
+// Out-of-office / auto-reply wording (only used when PodPitch has not labelled the reply).
+function isAutoReplyText(text) {
+	const t = String(text || '')
+		.slice(0, 600)
+		.toLowerCase();
+	return /(out of (the )?office|i('| a)m (currently )?(away|out|travel)|i am (currently )?(away|out of)|away from (the office|my desk|email)|on (annual )?leave|on vacation|on holiday|limited access to (my )?email|will be back (on|in|by)|i'll be back (on|in|by)|be back on|return(ing)? on|automatic reply|auto-?reply|autoreply|this is an automated|do not reply to this email|thank you for your (email|message)[.!,]? (i|we)('m| am| are)? (currently )?(away|out))/.test(
+		t,
+	);
+}
+
 function latestOnly(text) {
 	let t = String(text);
 	const patterns = [
@@ -555,24 +624,37 @@ const ourDomains = (env) =>
  * ========================================================================= */
 
 async function connect(env) {
-	const token = await accessToken(env);
+	// Every step is timed, so a failure says exactly where PodPitch got stuck.
+	const steps = [];
+	const timed = async (step, fn) => {
+		const t0 = Date.now();
+		try {
+			const out = await fn();
+			steps.push({ step, ms: Date.now() - t0, ok: true });
+			return out;
+		} catch (err) {
+			steps.push({ step, ms: Date.now() - t0, ok: false, error: err.message.slice(0, 120) });
+			throw new Error(`${err.message} (step: ${step}, ${Math.round((Date.now() - t0) / 1000)}s)`);
+		}
+	};
+	const token = await timed('login token', () => accessToken(env));
 	let sessionId = null;
 	let id = 100;
 	// One retry for slow or temporarily failing requests (timeouts, 5xx, 429).
-	const post = async (body) => {
+	const post = async (body, limitMs) => {
 		try {
-			return await postOnce(body);
+			return await postOnce(body, limitMs);
 		} catch (err) {
 			if (!/timed out|HTTP 5\d\d|HTTP 429|fetch failed|network/i.test(err.message)) throw err;
 			await new Promise((r) => setTimeout(r, 1500));
-			return postOnce(body);
+			return postOnce(body, limitMs);
 		}
 	};
-	const postOnce = async (body) => {
+	const postOnce = async (body, limitMs = TIMEOUT_MS) => {
 		const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${token}` };
 		if (sessionId) headers['Mcp-Session-Id'] = sessionId;
 		const ctrl = new AbortController();
-		const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+		const timer = setTimeout(() => ctrl.abort(), limitMs);
 		try {
 			const res = await fetch(MCP_URL, { method: 'POST', headers, body: JSON.stringify(body), signal: ctrl.signal });
 			sessionId = res.headers.get('mcp-session-id') || sessionId;
@@ -597,22 +679,29 @@ async function connect(env) {
 						.pop() || '{}';
 			return JSON.parse(j);
 		} catch (err) {
-			throw new Error(err.name === 'AbortError' ? 'PodPitch timed out' : err.message);
+			throw new Error(err.name === 'AbortError' ? `PodPitch timed out after ${Math.round(limitMs / 1000)}s` : err.message);
 		} finally {
 			clearTimeout(timer);
 		}
 	};
-	await post({
-		jsonrpc: '2.0',
-		id: id++,
-		method: 'initialize',
-		params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'tpx-podpitch-updates', version: '1.0' } },
-	});
+	await timed('open session', () =>
+		post({
+			jsonrpc: '2.0',
+			id: id++,
+			method: 'initialize',
+			params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'tpx-podpitch-updates', version: '1.0' } },
+		}),
+	);
 	await post({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }).catch(() => {});
+	// Listing calls return more data, so they get more time.
+	const SLOW = new Set(['list_inbox_threads', 'list_campaigns', 'get_campaign_drafts']);
 	return {
+		steps,
 		async call(name, args) {
 			if (!READ_TOOLS.has(name)) throw new Error(`Blocked PodPitch tool: ${name}`);
-			const r = await post({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name, arguments: args } });
+			const r = await timed(name, () =>
+				post({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name, arguments: args } }, SLOW.has(name) ? 30000 : TIMEOUT_MS),
+			);
 			if (r?.error) throw new Error(`${name}: ${JSON.stringify(r.error).slice(0, 200)}`);
 			if (r?.result?.isError)
 				throw new Error(

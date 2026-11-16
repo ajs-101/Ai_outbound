@@ -6,33 +6,26 @@
   // Aman's Cloudflare account (Workers Paid)
   "account_id": "d8878d369e989c7c97a068bf93cf2ba2",
   "compatibility_date": "2026-10-06",
-
-  // Run the worker near the US APIs it calls (Anthropic, Instantly, Slack) instead of
-  // the edge location closest to the sender. Avoids Claude "403 Request not allowed" region blocks.
   "placement": {
     "mode": "smart"
   },
 
   // Daily at 05:00 UTC = 10:00 AM PKT (LinkedIn handoff)
   "triggers": {
-    // 05:00 UTC LinkedIn handoff | every 15 min PodPitch host replies | 12:30 UTC PodPitch new-matches digest
-    "crons": ["0 5 * * *", "*/15 * * * *", "30 12 * * *"]
+    "crons": ["0 5 * * *", "*/15 * * * *", "30 12 * * *", "12 4 * * 1"]
   },
 
   "vars": {
-    // LinkedIn handoff: Instantly campaign ID -> Aimfox campaign ID
-    // Warm lead Campaign -> Aimfox Warm lead | Finance Podcast Double Down + Finance Wide Net -> Aimfox Finance
-    "CAMPAIGN_MAP": "{\"0e593174-5ac1-463e-8e67-a01af0769809\":\"6f22e51e-1a4f-43f5-b736-5e726969d6dc\",\"2d9b83e5-64a0-46cd-a075-4d4de489cab2\":\"cd653611-6dba-4dee-88bd-e5ad932c2a23\",\"374eb15d-6ee4-446c-bea3-f250e1a9ced6\":\"cd653611-6dba-4dee-88bd-e5ad932c2a23\"}",
+    "CAMPAIGN_MAP": "{\"6a3797c3-b6b6-418b-8bd3-ad5026d0e6e7\":\"6f22e51e-1a4f-43f5-b736-5e726969d6dc\",\"2d9b83e5-64a0-46cd-a075-4d4de489cab2\":\"cd653611-6dba-4dee-88bd-e5ad932c2a23\",\"374eb15d-6ee4-446c-bea3-f250e1a9ced6\":\"cd653611-6dba-4dee-88bd-e5ad932c2a23\"}",
 
     // Reply drafting
     "CLAUDE_MODEL": "claude-sonnet-4-5",
 
     // One booking link for every campaign
     "CALENDLY_URL": "https://calendly.com/contact-aisearchengineers/strategy-in",
-    // Per-campaign booking links: campaign ID, or a word in the campaign name -> link
-    // Which company the replies write as, per campaign (campaign ID or a word in its name).
-    // Values: "asie", "credancy", "tpx". Any campaign not listed is "tpx" (Trustpoint Xposure).
-    "BRAND_MAP": "{\"2d9b83e5-64a0-46cd-a075-4d4de489cab2\":\"asie\",\"374eb15d-6ee4-446c-bea3-f250e1a9ced6\":\"asie\",\"68017a47-c704-4595-bfac-023dc9a364a7\":\"asie\",\"ee4f6cbe-c6f8-49e9-8447-6d282e146d4c\":\"credancy\",\"CRD\":\"credancy\",\"ASIE\":\"asie\"}",
+    "BRAND_MAP": "{\"2d9b83e5-64a0-46cd-a075-4d4de489cab2\":\"asie\",\"374eb15d-6ee4-446c-bea3-f250e1a9ced6\":\"asie\",\"68017a47-c704-4595-bfac-023dc9a364a7\":\"asie\",\"ASIE\":\"asie\"}",
+    // Booking link exception: the Ecommerce CRD campaign keeps its Credancy link (Aman, Nov 17).
+    // It still writes as TPX. Every other campaign uses CALENDLY_URL (ASIE strategy link).
     "CALENDLY_MAP": "{\"ee4f6cbe-c6f8-49e9-8447-6d282e146d4c\":\"https://calendly.com/credancy/15min\",\"CRD\":\"https://calendly.com/credancy/15min\"}",
 
     // Slack channels
@@ -40,6 +33,9 @@
     "SLACK_ESCALATIONS_CHANNEL": "C0CA0QE5VGQ",
     "SLACK_EDITS_CHANNEL": "C0C9A478N2G",
     "SLACK_AIMFOX_CHANNEL": "C0CCL7LCSCS",
+    // LinkedIn reply cards (#tpx-linkedin-replies). Empty = the replies channel.
+    "SLACK_LINKEDIN_CHANNEL": "C0CGB246GMS",
+    "SLACK_REPORT_CHANNEL": "C0C8XAANVME",
 
     // Approvers: Slack MEMBER IDs (start with U), comma-separated
     "SLACK_APPROVERS": "U0A0H0SKBSS",
@@ -51,10 +47,7 @@
 
     // Small fast model that turns the lead's profile into podcast search terms
     "QUERY_MODEL": "claude-haiku-4-5",
-
-    // Lead research (website + AI visibility check): ON HOLD until Workers Paid.
-    // To turn on later: set "true" and add the "queues" block (see research.js header).
-    "RESEARCH_ENABLED": "false",
+    "RESEARCH_ENABLED": "true",
 
     // PodPitch client updates -> #podpitch-clients-updates
     "PODPITCH_UPDATES_CHANNEL": "C0CCH7S9FSL",
@@ -71,18 +64,22 @@
     }
   ],
 
-  // Background queue for reply drafts (Workers Paid): drafting gets minutes instead of ~30 seconds,
-  // so PodPitch can take longer. Create once with:  npx wrangler queues create tpx-replies
   "queues": {
     "producers": [{ "binding": "REPLY_QUEUE", "queue": "tpx-replies" }],
     "consumers": [{ "queue": "tpx-replies", "max_batch_size": 1, "max_batch_timeout": 1, "max_retries": 2 }]
   },
 
-  // PodPitch login holder: one refresh at a time, strongly consistent (fixes "invalid_grant")
   "durable_objects": {
-    "bindings": [{ "name": "PP_AUTH", "class_name": "PodpitchAuth" }]
+    "bindings": [
+      { "name": "PP_AUTH", "class_name": "PodpitchAuth" },
+      { "name": "DRAFTS", "class_name": "DraftStore" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PodpitchAuth"] }],
+  // Never edit or remove a migration that has been deployed; only add new ones at the end.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["PodpitchAuth"] },
+    { "tag": "v2", "new_sqlite_classes": ["DraftStore"] }
+  ],
 
   "observability": {
     "enabled": true

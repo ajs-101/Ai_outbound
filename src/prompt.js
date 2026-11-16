@@ -45,7 +45,12 @@ LANGUAGE
 Reply in the language they wrote in. If it is not English, hand the thread to a human.
 
 LEAD RESEARCH
-You may get a LEAD RESEARCH section with facts from their own website. Use at most one detail from it, and only when it fits the reply naturally, for example their practice area or city. Never say you researched them, looked at their website or ran any check on them. Never mention AI search results, rankings or audits found about them. If the research is unclear, ignore it.
+You may get a LEAD RESEARCH section with facts from their website and public LinkedIn profile, and up to two likely pain points, each with where it was seen.
+- Answer what they asked first. Then, if one pain point fits the conversation, weave in ONE of them in a single soft line, using its natural angle, and tie it to how we help. Never more than one, and skip it when the reply is a short yes, a booking, a no, or an unsubscribe.
+- Say it as something common for firms like theirs, never as a finding about them. Never say you researched them, looked at their website or LinkedIn, saw their posts, or ran any check on them.
+- Never mention AI search results, rankings or audits found about them, and never point out something missing on their site in a way that sounds like criticism.
+- You may also use one plain detail (their practice area, city or specialty) if it fits.
+- If the research confidence is low or a pain point does not fit, ignore it.
 
 FACTS
 Use only facts written in this guidance or given in LEAD RESEARCH. Never invent results, client names, publications, numbers or timelines. If you need a fact that is not here, hand the thread to a human.
@@ -62,7 +67,7 @@ BEFORE EVERY REPLY, CHECK
 
 READ THE INTENT
 Interested ("sure", "tell me more", "how does it work"): answer in one line, then send the call link or offer the audit.
-Price question: give the starting range from Section 4, then offer the free audit to see which option fits.
+Price question: give the pricing line from Section 4, then offer the free audit or a quick call to see which option fits.
 Send me info: two lines on the relevant pitch, then offer the free audit. Never send attachments or long explanations.
 Not now: ask when is a better time to check back. If they give a date, follow up on that date.
 Wrong person or referral: thank them in three words and ask for the right person's name and email.
@@ -90,7 +95,7 @@ Do not draft a reply. Escalate when any of these is true:
 1. They are angry, insulting, or threaten to report us, or they mention a lawyer, a complaint, the bar, the FTC, CAN-SPAM or legal action.
 2. They ask for a contract, a proposal, an invoice, a refund, a discount, custom pricing or payment terms.
 3. They ask a legal, medical, HIPAA, bar advertising or other compliance question.
-4. They are an existing client of ours (Trustpoint Xposure, AI Search Engineers or Credancy), or mention working with our team already.
+4. They are an existing client of ours (Trustpoint Xposure or AI Search Engineers), or mention working with our team already.
 5. They ask whether results are guaranteed, whether ChatGPT or any AI tool will definitely recommend them, or for proof or case studies.
 6. They ask whether they are talking to a bot or an AI.
 7. They ask several questions at once, or the reply is sarcastic, unclear or in a language other than English.
@@ -136,9 +141,9 @@ How to answer: if interested, ask for their website (or confirm the one we have)
 
 MONEY
 If asked about price, always give this answer, in these words or very close to them:
-"The pricing depends on the scope of the work. Our lowest package starts from $500 and goes up depending on the requirements."
+"On pricing, it depends on the scope and the shows, and we offer customized solutions tailored to your budget."
 Then offer the free audit or a quick call to scope it for them.
-Never quote any other number, package name, monthly fee or range. Never discount. Custom pricing, quotes or payment terms go to a human.
+Never quote any number, price, package name, monthly fee or range. Never discount. Custom pricing, quotes or payment terms go to a human.
 
 WHAT IS GUARANTEED
 Only media placements where we have vetted outlet relationships, as written in the contract. AI recommendation is the goal of the work, never a promise.
@@ -170,78 +175,98 @@ The draft is plain text only. Never include the quoted thread in the draft.`;
 
 // Removes tracking/query parts (?from=slack, utm_*, #...) from Calendly links anywhere in a text.
 export function cleanCalendlyLinks(text) {
-	return String(text ?? '').replace(/(https?:\/\/(?:www\.)?calendly\.com\/[^\s?#<>()\[\]"']+)[?#][^\s<>()\[\]"']*/gi, '$1');
+  return String(text ?? "").replace(
+    /(https?:\/\/(?:www\.)?calendly\.com\/[^\s?#<>()\[\]"']+)[?#][^\s<>()\[\]"']*/gi,
+    "$1"
+  );
 }
 
 // Booking link for a campaign: CALENDLY_MAP keys are either a campaign ID (exact) or a word that
-// appears in the campaign name (e.g. "CRD"). Anything else gets CALENDLY_URL.
+// appears in the campaign name (e.g. "ASIE"). Anything else gets CALENDLY_URL.
 // Looks a campaign up in a JSON map whose keys are a campaign ID (exact match) or a word that
-// appears in the campaign name (e.g. "CRD"). Returns the value or undefined.
+// appears in the campaign name (e.g. "ASIE"). Returns the value or undefined.
 function matchCampaign(json, event = {}) {
-	let map = {};
-	try {
-		map = JSON.parse(json || '{}');
-	} catch {
-		map = {};
-	}
-	const id = String(event.campaign_id || event.campaign || '');
-	const name = String(event.campaign_name || '');
-	if (id && map[id]) return map[id];
-	for (const [k, v] of Object.entries(map)) {
-		if (/^[0-9a-f-]{36}$/i.test(k)) continue;
-		const word = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-		if (new RegExp(`\\b${word}\\b`, 'i').test(name)) return v;
-	}
-	return undefined;
+  let map = {};
+  try { map = JSON.parse(json || "{}"); } catch { map = {}; }
+  const id = String(event.campaign_id || event.campaign || "");
+  const name = String(event.campaign_name || "");
+  if (id && map[id]) return map[id];
+  for (const [k, v] of Object.entries(map)) {
+    if (/^[0-9a-f-]{36}$/i.test(k)) continue;
+    const word = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`\\b${word}\\b`, "i").test(name)) return v;
+  }
+  return undefined;
 }
 
 export function calendlyFor(env, event = {}) {
-	const link = matchCampaign(env.CALENDLY_MAP, event) || env.CALENDLY_URL;
-	return link ? cleanCalendlyLinks(String(link).trim()) : '';
+  const link = matchCampaign(env.CALENDLY_MAP, event) || env.CALENDLY_URL;
+  return link ? cleanCalendlyLinks(String(link).trim()) : "";
 }
 
-// Which company we write as, per campaign (BRAND_MAP -> "asie" | "credancy" | "tpx"; default tpx).
+// Which company we write as, per campaign (BRAND_MAP -> "asie" | "tpx"; default tpx).
+// Only TPX and ASIE are used. Any other value (old "credancy" entries included) falls back to TPX.
 const BRANDS = {
-	tpx: {
-		name: 'Trustpoint Xposure (TPX)',
-		short: 'a PR and AI visibility agency',
-		team: 'Trustpoint Xposure',
-		about:
-			'Trustpoint Xposure (TPX) is a PR and digital authority agency founded by David Wilder. We get professionals featured on podcasts and in the press, and we work on the signals AI search tools (ChatGPT, Gemini, Perplexity, Google AI Overviews) use when they recommend someone.',
-	},
-	asie: {
-		name: 'AI Search Engineers (ASIE)',
-		short: 'an AI search visibility agency',
-		team: 'AI Search Engineers',
-		about:
-			'AI Search Engineers (ASIE) helps businesses get found and recommended by AI search tools (ChatGPT, Gemini, Perplexity, Google AI Overviews), and gets professionals featured on podcasts their clients already listen to, which gives AI tools and Google more to point to.',
-	},
-	credancy: {
-		name: 'Credancy',
-		short: 'an AI search visibility agency',
-		team: 'Credancy',
-		about:
-			'Credancy helps businesses get found and recommended by AI search tools (ChatGPT, Gemini, Perplexity, Google AI Overviews), and gets founders featured on podcasts their customers already listen to, which gives AI tools and Google more to point to.',
-	},
+  tpx: {
+    name: "Trustpoint Xposure (TPX)",
+    short: "a PR and AI visibility agency",
+    team: "Trustpoint Xposure",
+    about: "Trustpoint Xposure (TPX) is a PR and digital authority agency founded by David Wilder. We get professionals featured on podcasts and in the press, and we work on the signals AI search tools (ChatGPT, Gemini, Perplexity, Google AI Overviews) use when they recommend someone.",
+  },
+  asie: {
+    name: "AI Search Engineers (ASIE)",
+    short: "an AI search visibility agency",
+    team: "AI Search Engineers",
+    about: "AI Search Engineers (ASIE) helps businesses get found and recommended by AI search tools (ChatGPT, Gemini, Perplexity, Google AI Overviews), and gets professionals featured on podcasts their clients already listen to, which gives AI tools and Google more to point to.",
+  },
 };
 
 export function brandFor(env, event = {}) {
-	const key = String(matchCampaign(env.BRAND_MAP, event) || 'tpx').toLowerCase();
-	return { key: BRANDS[key] ? key : 'tpx', ...(BRANDS[key] || BRANDS.tpx) };
+  const key = String(matchCampaign(env.BRAND_MAP, event) || "tpx").toLowerCase();
+  return { key: BRANDS[key] ? key : "tpx", ...(BRANDS[key] || BRANDS.tpx) };
+}
+
+// LinkedIn replies (Aimfox): same rules and offer as email, written like a chat message.
+const LINKEDIN_STYLE = `
+
+CHANNEL: LINKEDIN DIRECT MESSAGE (this overrides any email formatting rule above)
+You are replying inside a LinkedIn chat, after they accepted our connection request and answered one of our messages. Write like a real person texting on LinkedIn or WhatsApp:
+- One short block of text, 1 to 4 sentences, usually 25 to 70 words. Match their length.
+- NO blank lines between sentences or paragraphs. If you need a second thought, put it on the next line with a single line break, never an empty line.
+- No greeting line on its own, no sign-off, no name at the end, no signature, no subject.
+- Open with "Hey {first name}," or just start talking, then go straight into it.
+- Casual and warm: contractions, small words, "kinda", "honestly", "lol" only if they are casual first. Curious, not salesy.
+- React to what they actually said, and to their work (their company, product, a post they wrote, their field). Specific details beat generic praise.
+- If they push back or call something out, own it briefly and lightly ("fair call out, my bad"), then move on.
+- Only ask for a call when they show interest. Then give the booking link as a plain URL at the end ({{CALENDLY_URL}}), no markdown.
+- When they are not ready, no pitch: be genuinely curious about their work and leave the door open.
+- One question at most.
+
+EXAMPLES OF OUR LINKEDIN REPLIES (match this tone and shape, not the content)
+1. Hi Dallin, been a while since our last. Hope LitFlow and the practice have both been thriving. Been watching Pocket Defender from a distance, interesting space. No agenda, just stayed curious about your work.
+2. Hey Dallin, Yeah, that's a fair call out, my bad. I saw LitFlow and assumed it was your firm, pitched before really looking, kinda ironic given you literally write about people communicating poorly lol. Actually dug in now and it's a legal automation play, Pocket Defender and all that, which is cool. You clearly live in this space more than I do, so no pitch from me. Genuinely curious what you're working on though.
+3. Nice, figured you might. Honestly though your local influencer post has been stuck in my head, the whole idea of being the name your 3,000 already know before they ever need you. That's such a smart way to look at it. It's kinda the same thing I help with now, just on a different channel. When a Latina in Colorado asks ChatGPT for an injury lawyer, are you the name it hands them? Ever checked?
+4. Hey Derick, glad you circled back. How's everything going on your end? Whenever you want to pick up where we left off on the referrals and the site, just say the word
+
+LEAD RESEARCH ON LINKEDIN
+On LinkedIn it is natural to mention a post they wrote or what their company does, like example 3. Use at most one such detail and never say you "researched" them or "ran a check".
+In the JSON, "draft" is the LinkedIn message only, with no sign-off line, and "podcasts" is always [].`;
+
+export function buildLinkedinPrompt(env, calendlyUrl, brand) {
+  const calendly = calendlyUrl || calendlyFor(env) || "[CALENDLY LINK NOT SET]";
+  return buildSystemPrompt(env, calendly, brand) + LINKEDIN_STYLE.replaceAll("{{CALENDLY_URL}}", calendly);
 }
 
 export function buildSystemPrompt(env, calendlyUrl, brand) {
-	const calendly = calendlyUrl || calendlyFor(env) || '[CALENDLY LINK NOT SET]';
-	const b = brand || BRANDS.tpx;
-	return (
-		(GUIDANCE + OUTPUT_FORMAT)
-			.replaceAll('{{CALENDLY_URL}}', calendly)
-			.replaceAll('{{BRAND_NAME}}', b.name)
-			.replaceAll('{{BRAND_SHORT}}', b.short)
-			.replaceAll('{{BRAND_TEAM}}', b.team)
-			.replaceAll('{{BRAND_ABOUT}}', b.about) +
-		'\n\nLINKS\nWrite the booking link as a markdown link with short natural anchor text, for example ' +
-		`[grab a time here](${calendly}) or [book a quick call](${calendly}). Never paste the bare URL on its own. ` +
-		'Use the link exactly as given above. Never add query parameters, tracking tags or anything after it.'
-	);
+  const calendly = calendlyUrl || calendlyFor(env) || "[CALENDLY LINK NOT SET]";
+  const b = brand || BRANDS.tpx;
+  return (GUIDANCE + OUTPUT_FORMAT)
+    .replaceAll("{{CALENDLY_URL}}", calendly)
+    .replaceAll("{{BRAND_NAME}}", b.name)
+    .replaceAll("{{BRAND_SHORT}}", b.short)
+    .replaceAll("{{BRAND_TEAM}}", b.team)
+    .replaceAll("{{BRAND_ABOUT}}", b.about) +
+    "\n\nLINKS\nWrite the booking link as a markdown link with short natural anchor text, for example " +
+    `[grab a time here](${calendly}) or [book a quick call](${calendly}). Never paste the bare URL on its own. ` +
+    "Use the link exactly as given above. Never add query parameters, tracking tags or anything after it.";
 }
