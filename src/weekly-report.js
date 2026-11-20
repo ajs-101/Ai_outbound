@@ -23,6 +23,7 @@ const startOfDay = (ms) => Math.floor(ms / DAY) * DAY;
 export async function logDraft(env, rec) {
   try {
     if (!rec?.email_id || !rec.created_at || rec.status === "processing" || rec.status === "sending") return;
+    if (rec.kind === "followup") return;   // follow-ups have their own log (fulog:)
     const meta = {
       s: rec.status,
       a: rec.action || "",
@@ -222,7 +223,20 @@ export async function buildWeeklyReport(env, opts = {}) {
     newMatches: sum(pp.filter((x) => x.k === "matches"), "n"),
   };
 
-  return { from, to, days, range: range(from, to), email, desk, linkedin, podpitch, errors };
+  // Follow-ups (fulog: written by followups.js)
+  const fl = await logsBetween(env, "fulog", from, to);
+  const ev = (e) => fl.filter((x) => x.e === e);
+  const followups = {
+    started: ev("started").length,
+    sent: ev("sent").length,
+    edited: ev("sent").filter((x) => x.ed).length,
+    skipped: ev("skipped").length,
+    stopped: ev("stopped").length,
+    expired: ev("stopped").filter((x) => x.r === "expired").length,
+    repliesByStep: [1, 2, 3, 4, 5, 6].map((k) => ev("reply").filter((x) => x.n === k).length),
+  };
+
+  return { from, to, days, range: range(from, to), email, desk, linkedin, podpitch, followups, errors };
 }
 
 /* ---------- Slack message ---------- */
@@ -274,6 +288,15 @@ export function reportBlocks(r, esc) {
       ? `${n(r.linkedin.moved)} leads moved to Aimfox · ${r.linkedin.failed} failed · ${r.linkedin.noLinkedIn} had no LinkedIn (${pl(r.linkedin.runs, "daily run")})`
       : "No handoff runs logged this week.")));
 
+  const f = r.followups || { started: 0, sent: 0, repliesByStep: [] };
+  if (f.started || f.sent) {
+    const replies = f.repliesByStep.map((v, i) => (v ? `after #${i + 1}: ${v}` : "")).filter(Boolean).join(" · ");
+    blocks.push(section(
+      `*Follow-ups*\n` +
+      `${pl(f.started, "sequence")} started · ${pl(f.sent, "follow-up")} sent (${f.edited} edited) · ${f.skipped} skipped · ${f.stopped} stopped${f.expired ? ` (${f.expired} expired unapproved)` : ""}\n` +
+      `Lead replies after a follow-up: ${replies || "none yet"}`));
+  }
+
   // Worth a look
   const flags = [];
   for (const c of e.campaigns) {
@@ -285,6 +308,7 @@ export function reportBlocks(r, esc) {
   if (d.sent >= 5 && d.sentEdited / d.sent > 0.5) flags.push(`More than half of sent drafts were edited first: check #outbound-edits for patterns to add to the guidance.`);
   if (d.podErrors >= 3) flags.push(`PodPitch did not answer ${d.podErrors} times, so those drafts had no show picks.`);
   if (e.sent && e.prevSent && e.sent < e.prevSent * 0.6) flags.push(`Sending dropped ${Math.round((1 - e.sent / e.prevSent) * 100)}% from last week: check campaign status and inbox health.`);
+  if (f.expired) flags.push(`${pl(f.expired, "follow-up card")} expired without approval: check #tpx-followups daily.`);
   if (r.linkedin.failed) flags.push(`${r.linkedin.failed} LinkedIn handoffs failed: see #aimfox-updates.`);
   if (flags.length) blocks.push(section(`*Worth a look*\n${flags.map((f) => `• ${f}`).join("\n")}`));
   if (r.errors.length) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: `Some numbers are missing: ${esc(r.errors.join("; ")).slice(0, 400)}` }] });

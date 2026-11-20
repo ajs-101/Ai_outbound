@@ -20,7 +20,9 @@ const FREE_MAIL = /@(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|aol|i
 export function shouldResearch(latest) {
   const t = String(latest || "").toLowerCase();
   if (!t.trim()) return false;
-  return !/(unsubscribe|remove me|take me off|stop emailing|do not contact|don't contact|not interested|no thanks|no thank you|out of (the )?office|on vacation|on leave|auto-?reply|automatic reply)/i.test(t);
+  // "Not interested" / "no thanks" ARE researched: the reply to a soft no uses one specific gap from the research.
+  // Hard stops (unsubscribe, remove me, do not contact) and auto-replies are not.
+  return !/(unsubscribe|remove me|take me off|stop emailing|stop contacting|do not contact|don't contact|do not email|don't email|out of (the )?office|on vacation|on leave|auto-?reply|automatic reply)/i.test(t);
 }
 
 export function websiteFor(event) {
@@ -175,10 +177,12 @@ ${useSearch
    - source "lead data": from the title / headline / company info we gave you
    - source "ai search": they do not show up in step 4 while competitors do
    "evidence" quotes or describes exactly what you saw. "angle" is one soft, natural line a salesperson could say, without saying where it came from (good: "a lot of newer firms find it hard to get in front of the right clients early on"; bad: "I saw your website has no reviews").
+   "observation" is the same gap said DIRECTLY and specifically, as one factual sentence a salesperson could say to them when they push back (good: "your site doesn't mention a single podcast or press feature"; "when I asked ChatGPT for the top wealth managers in Houston, it named X and Y, not you"). Only what you actually saw, no exaggeration, no insult.
+   Prefer gaps that are concrete and checkable over generic ones.
    No evidence = no pain point. Never use personal, health, financial or sensitive details. Fewer is better than weak.
 Never invent facts. If the website text is empty, rely only on the lead info and the searches, and say so in confidence.
 Return ONLY this JSON, no prose:
-{"firm_summary":"","specialty":"","city":"","personal_hook":"","profile_note":"one line on the person from LinkedIn, or empty","pain_points":[{"pain":"","source":"website | linkedin | lead data | ai search","evidence":"","angle":""}],"ai_visibility":{"query":"","found":"yes | no | unclear","position_note":"","competitors":["max 3 firm names"]},"confidence":"high | medium | low"}`;
+{"firm_summary":"","specialty":"","city":"","personal_hook":"","profile_note":"one line on the person from LinkedIn, or empty","pain_points":[{"pain":"","source":"website | linkedin | lead data | ai search","evidence":"","angle":"","observation":""}],"ai_visibility":{"query":"","found":"yes | no | unclear","position_note":"","competitors":["max 3 firm names"]},"confidence":"high | medium | low"}`;
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RESEARCH_TIMEOUT_MS);
@@ -219,6 +223,7 @@ Return ONLY this JSON, no prose:
           source: ["website", "linkedin", "lead data", "ai search"].includes(String(p?.source || "").toLowerCase()) ? String(p.source).toLowerCase() : "",
           evidence: String(p?.evidence || "").slice(0, 220),
           angle: String(p?.angle || "").slice(0, 220),
+          observation: String(p?.observation || "").slice(0, 240),
         }))
         .filter((p) => p.pain && p.source && p.evidence)   // no source or evidence = dropped
         .slice(0, 2),

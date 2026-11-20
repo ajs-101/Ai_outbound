@@ -1,14 +1,3 @@
-// PodPitch login holder (Durable Object).
-//
-// Why: PodPitch replaces the refresh token on every refresh and rejects the old one. KV storage can
-// show an old value for up to a minute in other locations, so two runs could refresh with the same
-// token and PodPitch would cancel the login ("invalid_grant"). A Durable Object is one single
-// instance with strongly consistent storage, and blockConcurrencyWhile lets only one refresh run at a
-// time, so the newest token is always the one used.
-//
-// Seeded from the PODPITCH_OAUTH secret. After a new  node podpitch-login.mjs  +  secret put,
-// it notices the secret changed and starts from the new login automatically.
-
 export class PodpitchAuth {
 	constructor(state, env) {
 		this.state = state;

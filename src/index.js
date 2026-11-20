@@ -1,51 +1,17 @@
-// TPX outbound worker (Cloudflare Workers, JavaScript)
-//
-// 1. LinkedIn handoff (cron, daily 05:00 UTC + manual /run):
-//    Instantly leads that finished a sequence with no reply -> Aimfox campaign targets.
-// 2. Slack reply approval:
-//    Instantly reply_received webhook -> Claude drafts a reply -> Slack card with
-//    [Approve & send] [Edit] [Reject] -> on approval the worker sends it via the Instantly API
-//    from the same inbox, in the same thread. Nothing is ever sent without a click.
-// 4. PodPitch client updates (cron every 15 min + daily digest): host replies and new matches
-//    from PodPitch -> #podpitch-clients-updates. Read-only PodPitch login (secret PODPITCH_OAUTH).
-// 3. Lead research (ON HOLD; needs the REPLY_QUEUE binding, Workers Paid): before drafting, reads the lead's
-//    website and runs an AI visibility check (Claude web search). One website detail may be used
-//    in the draft; the visibility result is shown on the Slack card only.
-//
-// Routes
-//   GET  /                       health check
-//   GET  /run?key=RUN_SECRET     manual LinkedIn handoff (&dry=1 to preview)
-//   GET  /aimfox/campaigns?key=RUN_SECRET   all Instantly + Aimfox campaign IDs and the current mapping
-//   POST /instantly/reply?key=INSTANTLY_WEBHOOK_SECRET   Instantly webhook (event: reply_received)
-//   POST /slack/interact         Slack interactivity (buttons + modals)
-//   GET  /podpitch/run?key=RUN_SECRET[&dry=1][&since_hours=48]   PodPitch host replies now
-//   GET  /podpitch/digest?key=RUN_SECRET[&dry=1]                 PodPitch new-matches digest now
-//
-// Secrets (npx wrangler secret put NAME):
-//   INSTANTLY_API_KEY, AIMFOX_API_KEY, RUN_SECRET, SLACK_WEBHOOK_URL,
-//   ANTHROPIC_API_KEY, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, INSTANTLY_WEBHOOK_SECRET
-// Vars (wrangler.jsonc): CAMPAIGN_MAP, CLAUDE_MODEL, CALENDLY_URL, SLACK_APPROVERS,
-//   SLACK_REPLIES_CHANNEL, SLACK_ESCALATIONS_CHANNEL, SLACK_EDITS_CHANNEL, PODPITCH_MCP_URL,
-//   QUERY_MODEL, RESEARCH_ENABLED ("true"/"false"), RESEARCH_MODEL (optional)
-// Secrets also: PODPITCH_OAUTH (PodPitch login for client updates); PODPITCH_API_KEY optional
-// KV: HANDOFF_KV (handoff done-markers, lead threads, research cache; drafts from before v2)
-// Durable Objects: DRAFTS (reply drafts, strongly consistent), PP_AUTH (PodPitch login)
-// Queue: REPLY_QUEUE (producer + consumer "tpx-replies"); without it replies run inline as before
-// 5. LinkedIn replies (linkedin.js): Aimfox "New Reply" webhook -> POST /aimfox/webhook?key=AIMFOX_WEBHOOK_SECRET
-//    -> LinkedIn-style draft -> card in SLACK_LINKEDIN_CHANNEL -> Approve sends it through Aimfox.
-
-import { buildSystemPrompt, buildLinkedinPrompt, cleanCalendlyLinks, calendlyFor, brandFor } from "./prompt.js";
+import { buildSystemPrompt, buildLinkedinPrompt, cleanCalendlyLinks, calendlyFor, brandFor, brandByKey } from "./prompt.js";
 export { PodpitchAuth } from "./podpitch-auth.js";
 export { DraftStore } from "./draft-store.js";
 import { isPodcastThread, findPodcastCandidates, addListenLinks } from "./podpitch.js";
 import { researchLead, shouldResearch } from "./research.js";
 import { runPodpitchUpdates, runPodpitchDigest, runPodpitchTest } from "./podpitch-updates.js";
 import { runWeeklyReport, logDraft, logHandoff, logPodpitch } from "./weekly-report.js";
+import { startSequence, stopOnLeadReply, runFollowups, followupReminders, handleFollowupAction, handleFollowupView, handleFollowupRoute } from "./followups.js";
 import { handleAimfoxWebhook, runLinkedin, handleLinkedinAction, handleLinkedinView, handleAimfoxLast } from "./linkedin.js";
 
 const PODPITCH_POLL_CRON = "*/15 * * * *";   // host replies
 const PODPITCH_DIGEST_CRON = "30 12 * * *";  // 12:30 UTC = 5:30 PM PKT, new matches digest
 const WEEKLY_REPORT_CRON = "12 4 * * 1";     // Monday 04:12 UTC = 9:12 AM PKT, weekly report
+const FOLLOWUP_CRON = "7 13 * * *";          // 13:07 UTC = 6:07 PM PKT, daily follow-up batch (weekends skipped in code)
 
 const INSTANTLY_BASE = "https://api.instantly.ai/api/v2";
 const AIMFOX_BASE = "https://api.aimfox.com/api/v3";
@@ -63,8 +29,6 @@ const SLACK_MAX_AGE_SECONDS = 300;         // reject Slack requests older than 5
 const CLAUDE_RETRY_DELAYS_MS = [2000, 5000]; // 2 retries; total stays inside the ~30s background limit
 
 export default {
-  // Queue consumer: each message is one Instantly reply (or a Slack "Retry draft").
-  // runDraft never throws (it posts a failure card with a Retry button), so every message is acked.
   async queue(batch, env) {
     for (const msg of batch.messages) {
       const { event, colo, retriedBy, kind, id, payload } = msg.body || {};
@@ -79,10 +43,17 @@ export default {
       ctx.waitUntil(runPodpitchUpdates(env, { slackPost }).then((r) => logPodpitch(env, "replies", r)).catch((e) => podpitchAlert(env, "updates", e)));
       // Same 15-minute tick: close cards whose lead was already answered in Unibox.
       ctx.waitUntil(sweepAnswered(env).catch((e) => console.error(`Answered sweep failed: ${e.message}`)));
+      ctx.waitUntil(followupReminders(env, fuDeps()).catch((e) => console.error(`Follow-up reminders failed: ${e.message}`)));
       return;
     }
     if (event.cron === PODPITCH_DIGEST_CRON) {
       ctx.waitUntil(runPodpitchDigest(env, { slackPost }).then((r) => logPodpitch(env, "matches", r)).catch((e) => podpitchAlert(env, "digest", e)));
+      return;
+    }
+    if (event.cron === FOLLOWUP_CRON) {
+      ctx.waitUntil(runFollowups(env, fuDeps()).then((r) => {
+        if (r.errors?.length) console.warn(`Follow-up batch errors: ${r.errors.join("; ")}`);
+      }).catch((e) => slackPost(env, env.SLACK_ESCALATIONS_CHANNEL, { text: `Follow-up batch FAILED: ${e.message}` }).catch(() => {})));
       return;
     }
     if (event.cron === WEEKLY_REPORT_CRON) {
@@ -102,6 +73,7 @@ export default {
       if (url.pathname === "/podpitch/run" || url.pathname === "/podpitch/digest" || url.pathname === "/podpitch/test") return handlePodpitchRun(env, url);
       if (url.pathname === "/drafts/sweep") return handleSweepRun(env, url);
       if (url.pathname === "/report/weekly") return handleReportRun(env, url);
+      if (url.pathname.startsWith("/followups/")) return handleFollowupRoute(env, url, fuDeps());
       if (url.pathname === "/aimfox/webhook" && request.method === "POST") return handleAimfoxWebhook(request, env, ctx, url, liDeps());
       if (url.pathname === "/aimfox/last") return handleAimfoxLast(env, url);
       if (url.pathname === "/instantly/reply" && request.method === "POST") return handleInstantlyReply(request, env, ctx, url);
@@ -114,10 +86,6 @@ export default {
   },
 };
 
-/* =========================================================================
- * PODPITCH CLIENT UPDATES (manual run + failure alert)
- * ========================================================================= */
-
 async function handlePodpitchRun(env, url) {
   if (url.searchParams.get("key") !== env.RUN_SECRET) return new Response("unauthorized", { status: 401 });
   const opts = { dry: url.searchParams.get("dry") === "1", sinceHours: Number(url.searchParams.get("since_hours") || 0) };
@@ -129,14 +97,10 @@ async function handlePodpitchRun(env, url) {
     return Response.json({ error: err.message }, { status: 500 });
   }
 }
-
-// Alerts in #outbound-escalations, without spam:
-//  * login problems: right away (a person must run podpitch-login.mjs again)
-//  * temporary problems (PodPitch slow or down): only after 3 failed runs in a row (~45 min)
-//  * at most one alert per 6 hours
 async function podpitchAlert(env, what, err) {
   console.error(`PodPitch ${what} failed: ${err.message}`);
-  const login = /login|PODPITCH_OAUTH|401/i.test(err.message);
+  const login = /login expired|invalid_grant|PODPITCH_OAUTH|\b401\b|unauthorized/i.test(err.message) &&
+    !/network connection lost|timed out|fetch failed|ECONNRESET|\b5\d\d\b/i.test(err.message);
   const fails = Number((await env.HANDOFF_KV.get("pp:fails")) || 0) + 1;
   await env.HANDOFF_KV.put("pp:fails", String(fails), { expirationTtl: 24 * 3600 });
   if (!login && fails < 3) return;
@@ -150,10 +114,6 @@ async function podpitchAlert(env, what, err) {
     blocks: [section(`*PodPitch ${what} failed*\n\`${esc(err.message).slice(0, 400)}\`\n${action}`)],
   }).catch(() => {});
 }
-
-/* =========================================================================
- * 1. LINKEDIN HANDOFF -> Aimfox  (report in #aimfox-updates)
- * ========================================================================= */
 
 async function handleRun(request, env, url) {
   if (url.searchParams.get("key") !== env.RUN_SECRET) return new Response("unauthorized", { status: 401 });
@@ -405,10 +365,6 @@ function cleanLinkedIn(raw) {
   }
 }
 
-/* =========================================================================
- * 2a. INSTANTLY WEBHOOK -> CLAUDE DRAFT -> SLACK CARD
- * ========================================================================= */
-
 async function handleInstantlyReply(request, env, ctx, url) {
   if (url.searchParams.get("key") !== env.INSTANTLY_WEBHOOK_SECRET) {
     return new Response("unauthorized", { status: 401 });
@@ -420,6 +376,9 @@ async function handleInstantlyReply(request, env, ctx, url) {
 
   // Dedupe: Instantly can retry a webhook; one email_id = one Slack card.
   if (!(await claimDraft(env, event.email_id))) return new Response("duplicate");
+
+  // The lead wrote: any follow-up sequence for them stops right away.
+  if (event.lead_email) ctx.waitUntil(stopOnLeadReply(env, fuDeps(), event.lead_email));
 
   // Which Cloudflare data centre ran this (helps diagnose region blocks such as Claude 403)
   const colo = request.cf?.colo || "?";
@@ -525,7 +484,9 @@ async function processReply(env, event, opts = {}) {
     lead_email: event.lead_email,
     lead_name: leadName,
     campaign_name: event.campaign_name || "",
+    campaign_id: event.campaign_id || "",
     brand: brandFor(env, event).team,
+    brand_key: brandFor(env, event).key,
     unibox_url: event.unibox_url || "",
     latest,
     intent: ai.intent,
@@ -669,12 +630,17 @@ function candidatesText(candidates, podcastThread = false) {
 // Only the website facts go to the drafter. The AI visibility result stays on the card.
 function researchText(r) {
   if (!r || (!r.firm_summary && !r.personal_hook && !r.pain_points?.length)) return "";
-  const pains = (r.pain_points || []).map((p, i) => `${i + 1}. ${p.pain} (seen on: ${p.source}: ${p.evidence}). Natural angle: ${p.angle}`).join("\n");
+  const pains = (r.pain_points || []).map((p, i) => `${i + 1}. ${p.pain} (seen on: ${p.source}: ${p.evidence}). Natural angle: ${p.angle}` +
+    `${p.observation ? `. Direct observation (only for a soft no): ${p.observation}` : ""}`).join("\n");
+  const v = r.ai_visibility || {};
+  const ai = v.query && v.found === "no" && !r.search_error
+    ? `\nAI search check (only for a soft no): asked "${v.query}", they did NOT come up${v.competitors?.length ? `; named instead: ${v.competitors.join(", ")}` : ""}.`
+    : "";
   return `\n\nLEAD RESEARCH (from their website and public LinkedIn profile${r.confidence ? `, ${r.confidence} confidence` : ""}):\n` +
     `Firm: ${r.firm_summary || ""}\n` +
     (r.profile_note ? `Person: ${r.profile_note}\n` : "") +
     `Detail you could mention: ${r.personal_hook || "none"}\n` +
-    `Likely pain points:\n${pains || "none found"}`;
+    `Likely pain points:\n${pains || "none found"}${ai}`;
 }
 
 async function draftWithClaude(env, event, latest, senderFirst, candidates = [], research = null) {
@@ -814,13 +780,14 @@ async function handleSlackInteract(request, env, ctx) {
 
   if (payload.type === "block_actions") {
     const action = payload.actions?.[0] || {};
-    if (action.action_id === "open_unibox") return new Response("");
+    if (String(action.action_id).startsWith("open_")) return new Response("");   // link buttons: Slack opens the URL
 
     if (!isApprover(env, userId)) {
       ctx.waitUntil(ephemeral(payload.response_url, `You are not on the approver list for outbound replies. Your Slack member ID is \`${userId}\`: add it to SLACK_APPROVERS in wrangler.jsonc (comma-separated) and deploy.`));
       return new Response("");
     }
     if (String(action.action_id).startsWith("li_")) return handleLinkedinAction(env, ctx, liDeps(), payload, action, userId);
+    if (String(action.action_id).startsWith("fu_")) return handleFollowupAction(env, ctx, fuDeps(), payload, action, userId);
     const emailId = action.value;
 
     if (action.action_id === "retry_draft") {
@@ -887,6 +854,7 @@ async function handleSlackInteract(request, env, ctx) {
       return Response.json({ response_action: "errors", errors: { body: `You are not on the approver list (your Slack ID: ${userId}).` } });
     }
     if (String(view.callback_id).startsWith("li_")) return handleLinkedinView(env, ctx, liDeps(), payload, userId);
+    if (String(view.callback_id).startsWith("fu_")) return handleFollowupView(env, ctx, fuDeps(), payload, userId);
     const rec = await loadDraft(env, emailId);
     if (!rec || rec.status === "processing") return Response.json({ response_action: "errors", errors: { body: draftMissingText(rec) } });
 
@@ -941,6 +909,7 @@ async function sendReply(env, rec, rawText, userId, responseUrl, edited) {
       `${a.preview ? `: "${esc(a.preview)}"` : ""}. Clicked by <@${userId}>.`;
     await updateCard(env, fresh, line).catch(() => {});
     await tellUser(env, fresh, responseUrl, userId, "Not sent: this lead was already answered in the thread (see the card). Nothing went out.");
+    await startSequence(env, fuDeps(), fresh, a.at, "manual");
     return;
   }
   if (check.error) console.warn(`Thread check skipped for ${fresh.email_id}: ${check.error}`);
@@ -979,6 +948,8 @@ async function sendReply(env, rec, rawText, userId, responseUrl, edited) {
   await saveDraft(env, fresh);
   await updateCard(env, fresh, `Sent${edited ? " (edited)" : ""} by <@${userId}> ${slackTime(fresh.sent_at)}`);
   if (edited && text.trim() !== (fresh.draft || "").trim()) await logEdit(env, fresh, text, userId, null);
+  // Lead goes quiet now? The follow-up sequence takes over (stops by itself when they reply).
+  await startSequence(env, fuDeps(), fresh, fresh.sent_at, "sent");
 }
 
 // Looks at the whole email thread in Instantly. Returns:
@@ -1182,6 +1153,13 @@ const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").
 const quote = (s) => esc(String(s || "").slice(0, 2500)).split("\n").map((l) => `>${l}`).join("\n");
 const slackTime = (ms) => `<!date^${Math.floor(ms / 1000)}^{date_short_pretty} {time}|${new Date(ms).toISOString()}>`;
 
+// Everything followups.js needs from this file.
+function fuDeps() {
+  return {
+    ...liDeps(), buildSystemPrompt, brandByKey, senderFirstName, lintDraft, textToHtml, textWithLinks, permalink,
+  };
+}
+
 // Everything linkedin.js needs from this file (it shares the draft store, Slack helpers and research).
 function liDeps() {
   return {
@@ -1275,7 +1253,7 @@ async function saveDraft(env, rec) {
 
 // List of cards still waiting for a click (pend:<email_id>), used by the "answered in Unibox" sweep.
 async function indexPending(env, rec) {
-  if (!rec?.email_id || rec.status === "processing" || rec.kind === "linkedin") return;
+  if (!rec?.email_id || rec.status === "processing" || rec.kind === "linkedin" || rec.kind === "followup") return;
   const key = `pend:${rec.email_id}`;
   try {
     if (rec.status === "pending" && rec.channel && rec.ts) {
@@ -1354,7 +1332,10 @@ async function sweepAnswered(env, opts = {}) {
     if (!lock.ok) continue;   // someone clicked in the meantime
     const line = `Closed: ${esc(a.from || "someone on the team")} ${a.scheduled ? "has a reply scheduled for" : "already replied outside Slack"} ${a.at ? slackTime(a.at) : ""}` +
       `${a.preview ? `: "${esc(a.preview)}"` : ""}. Nothing was sent from this card.`;
-    if (!opts.dry) await updateCard(env, lock.current, line).catch((e) => out.errors.push(`${rec.lead_email}: card ${e.message}`));
+    if (!opts.dry) {
+      await updateCard(env, lock.current, line).catch((e) => out.errors.push(`${rec.lead_email}: card ${e.message}`));
+      await startSequence(env, fuDeps(), lock.current, a.at, "manual");
+    }
     out.closed.push(rec.lead_email);
   }
   return out;
